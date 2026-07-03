@@ -2,17 +2,11 @@
 
 Compositor-independant screenshot tool for Wayland with support for capturing the active output, active toplevel or a selection.
 
-Shoot is also *fast*:
-- arena allocators only
-- no libwayland
-- SIMD blitting
-- no frees
-
 ## Building
 
 Dependencies:
 - Odin compiler
-- libwebp
+- libpng
 
 ```sh
 ./build.sh
@@ -20,7 +14,7 @@ Dependencies:
 
 ## Usage
 
-The captured image is always encoded as WebP and printed to stdout.
+The captured image is always encoded as PNG and written to stdout.
 
 ```sh
 shoot output/display/monitor

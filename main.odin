@@ -11,8 +11,7 @@ import "core:strconv"
 import "core:os"
 import "core:fmt"
 import "core:sys/linux"
-import "core:simd"
-import "core:math"
+import "core:c/libc"
 
 import "ga"
 import "wayland"
@@ -20,7 +19,7 @@ import "wayland/wl"
 import "wayland/ext"
 import "wayland/wlr"
 import "wayland/xdg"
-import "webp"
+import "png"
 
 // IMPORTANT: this enum is very fragile and should not be changed,
 // becuase a lot of checks rely on this specific set of values
@@ -48,10 +47,10 @@ WLR_Toplevel :: struct {
 }
 
 Image :: struct {
-	size:                      [2]i32,
-	byte_stride, pixel_stride: i32,
-	data:                      uintptr,
-	format:                    wl.Shm_Format
+	size:        [2]i32,
+	stride:      i32,
+	data:        uintptr,
+	format:      wl.Shm_Format
 }
 
 Writer :: struct {
@@ -266,35 +265,41 @@ main :: proc() {
 				bound_max.y = max(output.position.y + output.image.size.y, bound_max.y)
 			}
 
-			// NOTE: the composite image is always ARGB
+			// NOTE: the composite image is always RGB
 			size        := bound_max - bound_min
+			format      := outputs[0].image.format
 			stride      := 4 * size.x
-			composition := make([]byte, size.y * stride, context.allocator)
+			composition := make([]byte, stride * size.y, context.allocator)
+
+			// HACK: they can technically differ, but assuming they don't saves a bit of work
+			when ODIN_DEBUG {
+				for output in outputs[1:] {
+					assert(output.image.format == format)
+				}
+			}
 
 			for output in outputs {
 				effective  := output.position - bound_min
 
 				src_start  := output.image.data
-				src_stride := uintptr(output.image.byte_stride)
+				src_stride := uintptr(output.image.stride)
 				dst_start  := uintptr(raw_data(composition)) + uintptr(effective.y * stride + effective.x * 4)
 				dst_stride := uintptr(stride)
 
-				#partial switch output.image.format {
-				case .Xbgr8888: blit(src_start, src_stride, dst_start, dst_stride, output.image.size, false, true)
-				case .Xrgb8888: blit(src_start, src_stride, dst_start, dst_stride, output.image.size, false, false)
-				case .Abgr8888: blit(src_start, src_stride, dst_start, dst_stride, output.image.size, true, true)
-				case .Argb8888: blit(src_start, src_stride, dst_start, dst_stride, output.image.size, true, false)
-				case:           log.fatal("Unsupported format:", image.format)
+				for _ in 0..<output.image.size.y {
+					intrinsics.mem_copy(rawptr(dst_start), rawptr(src_start), 4 * output.image.size.x)
+
+					src_start += src_stride
+					dst_start += dst_stride
 				}
 			}
 
 			selection_position -= bound_min
 			image = {
-				size         = size,
-				byte_stride  = stride,
-				pixel_stride = size.x,
-				data         = uintptr(raw_data(composition)),
-				format       = .Argb8888
+				size   = size,
+				stride = stride,
+				data   = uintptr(raw_data(composition)),
+				format = format
 			}
 		} else {
 			image = queue_output_capture(capture_manager, shm, output_source, outputs[0].wl)
@@ -303,12 +308,12 @@ main :: proc() {
 
 		// NOTE: crop to selection
 		image.size  = selection_size
-		image.data += uintptr(selection_position.y * image.byte_stride + selection_position.x * 4)
+		image.data += uintptr(selection_position.y * image.stride + selection_position.x * 4)
 	} else {
 		// NOTE: collect toplevels
 		toplevel_callback := wl.display_sync(display)
 
-		ext_toplevels := make(map[ext.Foreign_Toplevel_Handle_V1]EXT_Toplevel,  context.allocator)
+		ext_toplevels := make(map[ext.Foreign_Toplevel_Handle_V1]EXT_Toplevel, context.allocator)
 		wlr_toplevels := make(map[wlr.Foreign_Toplevel_Handle_V1]WLR_Toplevel, context.allocator)
 
 		// TODO: use the toplevel state protocol from ext instead of wlr
@@ -395,44 +400,38 @@ main :: proc() {
 		wait_captures(1)
 	}
 
-	// NOTE: encode image
-	picture: webp.Picture = ---
-	webp.PictureInit(&picture)
-	picture.width    = image.size.x
-	picture.height   = image.size.y
-	picture.use_argb = true
+	// NOTE: encode, output
+	writer := png.create_write_struct(png.LIBPNG_VER_STRING, nil, nil, nil)
+	png.init_io(writer, libc.stdout)
+
+	info := png.create_info_struct(writer)
+	png.set_IHDR(writer, info, u32(image.size.x), u32(image.size.y), 8, png.COLOR_TYPE_RGB, png.INTERLACE_NONE, png.COMPRESSION_TYPE_DEFAULT, png.FILTER_TYPE_DEFAULT)
+	png.write_info(writer, info)
 
 	#partial switch image.format {
-	case .Xbgr8888: webp.PictureAlloc(&picture); blit(image.data, uintptr(image.byte_stride), uintptr(picture.argb), uintptr(4 * picture.width), image.size, false, true)
-	case .Xrgb8888: webp.PictureAlloc(&picture); blit(image.data, uintptr(image.byte_stride), uintptr(picture.argb), uintptr(4 * picture.width), image.size, false, false)
-	case .Abgr8888: webp.PictureAlloc(&picture); blit(image.data, uintptr(image.byte_stride), uintptr(picture.argb), uintptr(4 * picture.width), image.size, true, true)
-	case .Argb8888: picture.argb = cast(^u32)image.data; picture.argb_stride = image.pixel_stride
-	case:           log.fatal("Unsupported format:", image.format)
+	case .Xbgr8888, .Abgr8888:
+		when ODIN_ENDIAN == .Big {
+			png.set_bgr(writer)
+		}
+	case .Xrgb8888, .Argb8888:
+		when ODIN_ENDIAN == .Little {
+			png.set_bgr(writer)
+		}
+	case:
+		log.fatal("Unsupported format:", image.format)
 	}
+	png.set_filler(writer, 0xff, png.FILLER_AFTER when ODIN_ENDIAN == .Little else png.FILLER_BEFORE)
 
-	config: webp.Config = ---
-	webp.ConfigInit(&config)
-	config.lossless   = 1
-	config.image_hint = .PICTURE
-
-	ga.free_all(&scratch)
-	writer := Writer{arena = &scratch}
-	picture.custom_ptr = &writer
-	picture.writer = proc "c" (data: ^u8, size: uint, picture: ^webp.Picture) -> i32 {
-		writer := cast(^Writer)picture.custom_ptr
-
-		old_size := len(writer.memory)
-		writer.memory = ga.resize(writer.arena, writer.memory, old_size + int(size))
-		intrinsics.mem_copy(&writer.memory[old_size], data, size)
-
-		return 1
+	rows   := make([]^byte, image.size.y, context.temp_allocator)
+	start  := uintptr(image.data)
+	stride := uintptr(image.stride)
+	for &row in rows {
+		row = cast([^]byte)start
+		start += stride
 	}
+	png.write_image(writer, raw_data(rows))
 
-	ok := webp.Encode(&config, &picture)
-	if !ok { log.fatal("Failed to encode image:", picture.error_code) }
-
-	// NOTE: write output
-	os.write(os.stdout, writer.memory)
+	png.write_end(writer, nil)
 }
 
 usage :: proc() {
@@ -441,7 +440,7 @@ usage :: proc() {
 	shoot toplevel/window
 	shoot selection "$(slurp)"
 
-The image is always printed to stdout as a WebP.
+The image is always written to stdout as a PNG.
 `)
 
 	os.exit(1)
@@ -452,25 +451,8 @@ display_error :: proc(event: wl.Display_Error_Event) {
 	log.fatalf("%s error: %s", type, event.message)
 }
 
-// NOTE: leak everything, it doesn't matter
-create_buffer :: proc(shm: wl.Shm, format: wl.Shm_Format, width, height: i32) -> (rawptr, wl.Buffer, i32) {
-	fd, fd_error := linux.memfd_create("image", {.CLOEXEC})
-	if fd_error != nil { log.fatal("Failed to create memfd:", fd_error) }
-
-	stride := 4 * width
-	size   := height * stride
-	linux.ftruncate(fd, i64(size))
-
-	data, data_error := linux.mmap(0, uint(size), {.READ}, {.SHARED}, fd)
-	if data_error != nil { log.fatal("Failed to map buffer data:", data_error) }
-
-	pool   := wl.shm_create_pool(shm, fd, size)
-	buffer := wl.shm_pool_create_buffer(pool, 0, width, height, stride, format)
-
-	return data, buffer, size
-}
-
 capture_source :: proc(manager: ext.Image_Copy_Capture_Manager_V1, shm: wl.Shm, source: ext.Image_Capture_Source_V1) -> Image {
+	// NOTE: create session
 	session := ext.image_copy_capture_manager_v1_create_session(manager, source, nil)
 
 	format: wl.Shm_Format = ---
@@ -495,19 +477,32 @@ capture_source :: proc(manager: ext.Image_Copy_Capture_Manager_V1, shm: wl.Shm, 
 		}
 	}
 
-	data, buffer, size := create_buffer(shm, format, width, height)
+	// NOTE: create buffer
+	fd, fd_error := linux.memfd_create("image", {.CLOEXEC})
+	if fd_error != nil { log.fatal("Failed to create memfd:", fd_error) }
 
+	pixel_width := i32(4)
+	stride      := pixel_width * width
+	size        := height * stride
+	linux.ftruncate(fd, i64(size))
+
+	data, data_error := linux.mmap(0, uint(size), {.READ}, {.SHARED}, fd)
+	if data_error != nil { log.fatal("Failed to map buffer data:", data_error) }
+
+	pool   := wl.shm_create_pool(shm, fd, size)
+	buffer := wl.shm_pool_create_buffer(pool, 0, width, height, stride, format)
+
+	// NOTE: capture
 	frame := ext.image_copy_capture_session_v1_create_frame(session)
 	ext.image_copy_capture_frame_v1_attach_buffer(frame, buffer)
 	ext.image_copy_capture_frame_v1_damage_buffer(frame, 0, 0, width, height)
 	ext.image_copy_capture_frame_v1_capture(frame)
 
 	return {
-		size         = {width, height},
-		byte_stride  = 4 * width,
-		pixel_stride = width,
-		data         = uintptr(data),
-		format       = format
+		size   = {width, height},
+		stride = pixel_width * width,
+		data   = uintptr(data),
+		format = format
 	}
 }
 
@@ -540,46 +535,5 @@ wait_captures :: proc(count: int) {
 				display_error(event)
 			}
 		}
-	}
-}
-
-blit :: proc(src_start, src_stride, dst_start, dst_stride: uintptr, size: [2]i32, $has_alpha, $reverse: bool) {
-	WIDTH :: 8
-
-	compute_pixel :: proc(pixel: #simd[WIDTH]u32, $has_alpha, $reverse: bool) -> #simd[WIDTH]u32 {
-		a   := pixel & 0xff000000 when has_alpha else cast(#simd[WIDTH]u32)(0xff << 24)
-		rgb := simd.shl(pixel & 0x0000ff, 16) | (pixel & 0x00ff00) | simd.shr(pixel, 0xff0000) when reverse else pixel & 0xffffff
-		return a | rgb
-	}
-
-	src_row := src_start
-	dst_row := dst_start
-	src_ptr := src_row
-	dst_ptr := dst_row
-
-	vector_count, tail := math.divmod(size.x, WIDTH)
-	index              := simd.indices(#simd[WIDTH]i32)
-	tail_mask          := simd.lanes_lt(index, cast(#simd[WIDTH]i32)tail)
-
-	for y in 0..<size.y {
-		for x in 0..<vector_count {
-			src := intrinsics.unaligned_load(cast(^#simd[WIDTH]u32)src_ptr)
-			dst := compute_pixel(src, has_alpha, reverse)
-			intrinsics.unaligned_store(cast(^#simd[WIDTH]u32)dst_ptr, dst)
-
-			src_ptr += 4 * WIDTH
-			dst_ptr += 4 * WIDTH
-		}
-
-		if tail > 0 {
-			src := simd.masked_load(rawptr(src_ptr), cast(#simd[WIDTH]u32)0, tail_mask)
-			dst := compute_pixel(src, has_alpha, reverse)
-			simd.masked_store(rawptr(dst_ptr), dst, tail_mask)
-		}
-
-		src_row += src_stride
-		dst_row += dst_stride
-		src_ptr  = src_row
-		dst_ptr  = dst_row
 	}
 }

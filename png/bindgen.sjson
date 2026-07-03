@@ -1,0 +1,27 @@
+inputs = ["headers"]
+output_folder = "."
+import_lib = "system:png"
+imports_file = ""
+package_name = "png"
+
+remove_type_prefix = "png_"
+remove_macro_prefix = "PNG_"
+remove_function_prefix = "png_"
+remove_type_suffix = ""
+force_ada_case_types = true
+rename = {}
+bit_setify = {}
+type_overrides = {}
+struct_field_overrides = {}
+struct_field_tags = {}
+struct_align = {}
+remove_enum_members = []
+remove_enum_member_prefix = {}
+procedure_type_overrides = {}
+procedure_parameter_defaults = {}
+remove = []
+deanon_enums = {}
+enumify_macros = {},
+procedures_at_end = false
+clang_include_paths = ["/usr/lib/clang/21/include"]
+clang_defines = {"PNG_FLOATING_POINT_SUPPORTED" = "1"}
